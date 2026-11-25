@@ -1,0 +1,78 @@
+name: Supabase Keepalive
+
+on:
+  schedule:
+    - cron: "17 4 * * *" # daily, 04:17 UTC (10:17 in Bangladesh)
+  workflow_dispatch:
+    inputs:
+      commit_every_days:
+        description: "Commit only if the last commit is at least this many days old (0 = force a commit, for testing)"
+        required: false
+        default: "30"
+
+env:
+  # The only place the function name appears. Must match supabase/keepalive.sql.
+  KEEPALIVE_FN: zz_keepalive_ping
+  COMMIT_EVERY_DAYS: ${{ inputs.commit_every_days || '30' }}
+
+permissions: {}
+
+jobs:
+  ping:
+    name: Ping Supabase
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Call keepalive function
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_KEY" ]; then
+            echo "::error::Missing SUPABASE_URL or SUPABASE_PUBLISHABLE_KEY secret"
+            exit 1
+          fi
+          curl --fail-with-body --silent --show-error \
+            --retry 3 --retry-delay 5 --max-time 20 \
+            -X POST "${SUPABASE_URL%/}/rest/v1/rpc/${KEEPALIVE_FN}" \
+            -H "apikey: ${SUPABASE_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{}'
+          echo
+          echo "Supabase keepalive OK"
+
+  repo-activity:
+    name: Keep repository active
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Commit only if no commit in the last N days
+        run: |
+          set -euo pipefail
+          last_commit_ts=$(git log -1 --format=%ct)
+          age_days=$(( ( $(date +%s) - last_commit_ts ) / 86400 ))
+          echo "Last commit: $(date -u -d "@${last_commit_ts}" +%FT%TZ) (${age_days} day(s) ago)"
+          echo "Threshold:   ${COMMIT_EVERY_DAYS} day(s)"
+
+          if [ "$age_days" -lt "$COMMIT_EVERY_DAYS" ]; then
+            echo "Repository already active. No commit needed."
+            exit 0
+          fi
+
+          mkdir -p .github/keepalive
+          echo "Last keepalive commit: $(date -u +%FT%TZ)" > .github/keepalive/last-run.txt
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/keepalive/last-run.txt
+          git commit -m "chore: keepalive [skip ci]"
+          git push
+          echo "Keepalive commit pushed."
